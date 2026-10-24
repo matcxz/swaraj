@@ -1,9 +1,11 @@
 //! Parser and syntax model for the initial Swaraj language.
 //!
 //! A source file contains one package declaration and an indented mapping of
-//! fields. See the repository README for the language's initial syntax.
+//! fields. Expressions in fields can use bindings declared in a `let:` block.
 
 use std::collections::BTreeMap;
+
+mod expression;
 
 const MAX_NESTING_DEPTH: usize = 128;
 
@@ -28,12 +30,14 @@ pub struct Located<T> {
 /// A parsed Swaraj value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Value {
-    /// A quoted string or an unquoted atom. The initial language treats both
-    /// as strings; quoting is required when a value contains punctuation or
-    /// whitespace that is not allowed in an atom.
+    /// A string value.
     String(String),
-    /// A list of scalar strings.
-    List(Vec<Located<String>>),
+    /// A signed 64-bit integer.
+    Integer(i64),
+    /// A boolean value.
+    Boolean(bool),
+    /// A list of values.
+    List(Vec<Located<Value>>),
     /// A nested mapping of field names to values.
     Map(BTreeMap<String, Located<Value>>),
 }
@@ -84,12 +88,6 @@ impl Diagnostic {
             self.line, self.column, self.message, self.help
         )
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct LocatedChar {
-    value: char,
-    location: SourceLocation,
 }
 
 #[derive(Debug)]
@@ -147,7 +145,34 @@ impl<'a> Parser<'a> {
     }
 
     fn parse(mut self) -> Result<Package, Diagnostic> {
-        let Some(declaration) = self.lines.first() else {
+        let mut bindings = BTreeMap::new();
+        if self
+            .lines
+            .first()
+            .is_some_and(|line| line.indent == 0 && line.text == "let:")
+        {
+            self.position = 1;
+            bindings = self.parse_bindings()?;
+            let Some(in_line) = self.lines.get(self.position) else {
+                return Err(Diagnostic::new(
+                    1,
+                    1,
+                    "expected `in:` after the bindings",
+                    "add `in:` and then a package declaration.",
+                ));
+            };
+            if in_line.indent != 0 || in_line.text != "in:" {
+                return Err(Diagnostic::new(
+                    in_line.number,
+                    in_line.indent + 1,
+                    "expected `in:` after the bindings",
+                    "finish the `let:` block with `in:`.",
+                ));
+            }
+            self.position += 1;
+        }
+
+        let Some(declaration) = self.lines.get(self.position) else {
             return Err(Diagnostic::new(
                 1,
                 1,
@@ -155,6 +180,7 @@ impl<'a> Parser<'a> {
                 "start with `package name:`.",
             ));
         };
+        let declaration_index = self.position;
 
         let Some(name) = declaration
             .text
@@ -191,7 +217,7 @@ impl<'a> Parser<'a> {
             column: "package ".chars().count() + 1,
         };
 
-        self.position = 1;
+        self.position = declaration_index + 1;
         if self.position == self.lines.len() {
             return Err(Diagnostic::new(
                 declaration.number,
@@ -210,7 +236,7 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        let fields = self.parse_map(2)?;
+        let fields = self.parse_map(2, &bindings)?;
         if let Some(line) = self.lines.get(self.position) {
             if line.indent == 0 && line.text.starts_with("package ") {
                 return Err(Diagnostic::new(
@@ -235,7 +261,90 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_map(&mut self, indent: usize) -> Result<BTreeMap<String, Located<Value>>, Diagnostic> {
+    fn parse_bindings(&mut self) -> Result<BTreeMap<String, expression::Expression>, Diagnostic> {
+        let mut bindings = BTreeMap::new();
+        let mut saw_binding = false;
+
+        while self.position < self.lines.len() {
+            let line = &self.lines[self.position];
+            if line.indent == 0 && line.text == "in:" {
+                break;
+            }
+            if line.indent != 2 {
+                return Err(Diagnostic::new(
+                    line.number,
+                    line.indent + 1,
+                    "bindings must be indented by two spaces",
+                    "declare each binding as `  name: expression`.",
+                ));
+            }
+            let line_number = line.number;
+            let line_indent = line.indent;
+            let line_text = line.text;
+            let Some((name, raw_expression)) = line_text.split_once(':') else {
+                return Err(Diagnostic::new(
+                    line_number,
+                    line_indent + 1,
+                    "expected a binding in the form `name: expression`",
+                    "write a name, a colon, and an expression.",
+                ));
+            };
+            if !is_identifier(name) {
+                return Err(Diagnostic::new(
+                    line_number,
+                    line_indent + 1,
+                    "invalid binding name",
+                    "binding names may contain letters, digits, `_` and `-`, and must start with a letter or `_`.",
+                ));
+            }
+            if bindings.contains_key(name) {
+                return Err(Diagnostic::new(
+                    line_number,
+                    line_indent + 1,
+                    format!("binding `{name}` is declared more than once"),
+                    "keep one declaration for this binding or rename one of them.",
+                ));
+            }
+
+            let (raw_expression, leading_spaces) = trim_start_with_count(raw_expression);
+            if raw_expression.is_empty() {
+                return Err(Diagnostic::new(
+                    line_number,
+                    line_text.chars().count() + 1,
+                    format!("binding `{name}` needs an expression"),
+                    "add a value after the colon, such as `enabled: true`.",
+                ));
+            }
+            let location = SourceLocation {
+                line: line_number,
+                column: line_indent + name.chars().count() + 2 + leading_spaces,
+            };
+            let field_indent = line_indent;
+            let raw_expression = raw_expression.to_owned();
+            self.position += 1;
+            let source = self.collect_expression(&raw_expression, field_indent)?;
+            let parsed = expression::parse(&source, location)?;
+            bindings.insert(name.to_owned(), parsed);
+            saw_binding = true;
+        }
+
+        if !saw_binding {
+            let line = self.lines.get(self.position).map_or(1, |line| line.number);
+            return Err(Diagnostic::new(
+                line,
+                1,
+                "the `let:` block is empty",
+                "add at least one binding before `in:`.",
+            ));
+        }
+        Ok(bindings)
+    }
+
+    fn parse_map(
+        &mut self,
+        indent: usize,
+        bindings: &BTreeMap<String, expression::Expression>,
+    ) -> Result<BTreeMap<String, Located<Value>>, Diagnostic> {
         if indent / 2 > MAX_NESTING_DEPTH {
             let line = &self.lines[self.position];
             return Err(Diagnostic::new(
@@ -248,7 +357,8 @@ impl<'a> Parser<'a> {
 
         let mut fields = BTreeMap::new();
 
-        while let Some(line) = self.lines.get(self.position) {
+        while self.position < self.lines.len() {
+            let line = &self.lines[self.position];
             if line.indent < indent {
                 break;
             }
@@ -296,6 +406,7 @@ impl<'a> Parser<'a> {
             };
             self.position += 1;
 
+            let raw_value = raw_value.to_owned();
             let value = if raw_value.is_empty() {
                 let Some(child) = self.lines.get(self.position) else {
                     return Err(Diagnostic::new(
@@ -313,11 +424,11 @@ impl<'a> Parser<'a> {
                         "indent this field exactly two spaces more than its parent.",
                     ));
                 }
-                Value::Map(self.parse_map(indent + 2)?)
-            } else if raw_value.starts_with('[') {
-                Value::List(self.parse_list(raw_value, value_location, indent)?)
+                Value::Map(self.parse_map(indent + 2, bindings)?)
             } else {
-                Value::String(parse_scalar(raw_value, value_location)?)
+                let source = self.collect_expression(&raw_value, indent)?;
+                let parsed = expression::parse(&source, value_location)?;
+                expression::evaluate(&parsed, bindings)?
             };
 
             fields.insert(
@@ -332,82 +443,36 @@ impl<'a> Parser<'a> {
         Ok(fields)
     }
 
-    fn parse_list(
+    fn collect_expression(
         &mut self,
-        first_part: &str,
-        value_location: SourceLocation,
+        initial: &str,
         field_indent: usize,
-    ) -> Result<Vec<Located<String>>, Diagnostic> {
-        let mut chars = Vec::new();
-        let mut first_part_chars = first_part.chars();
-        let _opening_bracket = first_part_chars.next();
-        let contents_column = value_location.column + 1;
-        chars.extend(
-            first_part_chars
-                .enumerate()
-                .map(|(offset, value)| LocatedChar {
-                    value,
-                    location: SourceLocation {
-                        line: value_location.line,
-                        column: contents_column + offset,
-                    },
-                }),
-        );
-
-        loop {
-            match find_list_end(&chars) {
-                ListEnd::Found(end) => {
-                    if chars[end + 1..]
-                        .iter()
-                        .any(|character| !character.value.is_whitespace())
-                    {
-                        let trailing = chars[end + 1..]
-                            .iter()
-                            .find(|character| !character.value.is_whitespace())
-                            .expect("a non-whitespace character was found");
-                        return Err(Diagnostic::new(
-                            trailing.location.line,
-                            trailing.location.column,
-                            "unexpected text after list",
-                            "put the list value at the end of the field.",
-                        ));
-                    }
-                    return parse_list_items(&chars[..end]);
-                }
-                ListEnd::UnclosedString(location) => {
-                    return Err(Diagnostic::new(
-                        location.line,
-                        location.column,
-                        "quoted string is not closed",
-                        "close the string with `\"` before the list's closing `]`.",
-                    ));
-                }
-                ListEnd::NestedList(location) => {
-                    return Err(Diagnostic::new(
-                        location.line,
-                        location.column,
-                        "nested lists are not supported",
-                        "keep each list item scalar, such as `[gcc, make]`.",
-                    ));
-                }
-                ListEnd::NotFound => {}
+    ) -> Result<String, Diagnostic> {
+        let mut source = initial.to_owned();
+        let mut depth = 0usize;
+        let mut quoted = false;
+        let mut escaped = false;
+        for character in initial.chars() {
+            if escaped {
+                escaped = false;
+            } else if quoted && character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                quoted = !quoted;
+            } else if !quoted && character == '[' {
+                depth += 1;
+            } else if !quoted && character == ']' {
+                depth = depth.saturating_sub(1);
             }
+        }
+        if depth == 0 {
+            return Ok(source);
+        }
 
+        while depth > 0 {
             let Some(next) = self.lines.get(self.position) else {
-                let location = chars
-                    .last()
-                    .map_or(value_location, |character| SourceLocation {
-                        line: character.location.line,
-                        column: character.location.column + 1,
-                    });
-                return Err(Diagnostic::new(
-                    location.line,
-                    location.column,
-                    "list is missing its closing `]`",
-                    "close the list, for example `[rust, cargo]`.",
-                ));
+                return Ok(source);
             };
-
             let is_aligned_closing_line = next.indent == field_indent && next.text.starts_with(']');
             if !is_aligned_closing_line && next.indent != field_indent + 2 {
                 return Err(Diagnostic::new(
@@ -417,203 +482,26 @@ impl<'a> Parser<'a> {
                     "indent list items two spaces below the field and align the closing `]` with the field.",
                 ));
             }
-
-            let next_column = next.indent + 1;
-            chars.push(LocatedChar {
-                value: ' ',
-                location: SourceLocation {
-                    line: next.number,
-                    column: next_column,
-                },
-            });
-            chars.extend(
-                next.text
-                    .chars()
-                    .enumerate()
-                    .map(|(offset, value)| LocatedChar {
-                        value,
-                        location: SourceLocation {
-                            line: next.number,
-                            column: next_column + offset,
-                        },
-                    }),
-            );
+            source.push('\n');
+            source.push_str(&" ".repeat(next.indent));
+            source.push_str(next.text);
+            for character in next.text.chars() {
+                if escaped {
+                    escaped = false;
+                } else if quoted && character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quoted = !quoted;
+                } else if !quoted && character == '[' {
+                    depth += 1;
+                } else if !quoted && character == ']' {
+                    depth = depth.saturating_sub(1);
+                }
+            }
             self.position += 1;
         }
+        Ok(source)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ListEnd {
-    Found(usize),
-    UnclosedString(SourceLocation),
-    NestedList(SourceLocation),
-    NotFound,
-}
-
-fn find_list_end(chars: &[LocatedChar]) -> ListEnd {
-    let mut quoted = None;
-    let mut escaped = false;
-
-    for (index, character) in chars.iter().enumerate() {
-        if escaped {
-            escaped = false;
-        } else if quoted.is_some() && character.value == '\\' {
-            escaped = true;
-        } else if character.value == '"' {
-            if quoted.is_some() {
-                quoted = None;
-            } else {
-                quoted = Some(character.location);
-            }
-        } else if quoted.is_none() && character.value == '[' {
-            return ListEnd::NestedList(character.location);
-        } else if quoted.is_none() && character.value == ']' {
-            return ListEnd::Found(index);
-        }
-    }
-
-    quoted.map_or(ListEnd::NotFound, ListEnd::UnclosedString)
-}
-
-fn parse_list_items(chars: &[LocatedChar]) -> Result<Vec<Located<String>>, Diagnostic> {
-    let mut items = Vec::new();
-    let mut start = 0;
-    let mut quoted = false;
-    let mut escaped = false;
-
-    for (index, character) in chars.iter().enumerate() {
-        if escaped {
-            escaped = false;
-        } else if quoted && character.value == '\\' {
-            escaped = true;
-        } else if character.value == '"' {
-            quoted = !quoted;
-        } else if !quoted && character.value == ',' {
-            push_list_item(&mut items, &chars[start..index], Some(character.location))?;
-            start = index + 1;
-        }
-    }
-
-    push_list_item(&mut items, &chars[start..], None)?;
-    Ok(items)
-}
-
-fn push_list_item(
-    items: &mut Vec<Located<String>>,
-    chars: &[LocatedChar],
-    comma: Option<SourceLocation>,
-) -> Result<(), Diagnostic> {
-    let start = chars
-        .iter()
-        .position(|character| !character.value.is_whitespace());
-    let Some(start) = start else {
-        if let Some(location) = comma {
-            return Err(Diagnostic::new(
-                location.line,
-                location.column,
-                "expected a list item",
-                "add an item before this comma.",
-            ));
-        }
-        return Ok(());
-    };
-
-    let end = chars
-        .iter()
-        .rposition(|character| !character.value.is_whitespace())
-        .expect("a non-whitespace character was found")
-        + 1;
-    let item_chars = &chars[start..end];
-    let value = item_chars
-        .iter()
-        .map(|character| character.value)
-        .collect::<String>();
-    let location = item_chars[0].location;
-    let parsed = parse_scalar(&value, location)?;
-    items.push(Located {
-        value: parsed,
-        location,
-    });
-    Ok(())
-}
-
-fn parse_scalar(value: &str, location: SourceLocation) -> Result<String, Diagnostic> {
-    if value.starts_with('"') {
-        let mut result = String::new();
-        let mut chars = value.chars().enumerate();
-        let _opening_quote = chars.next();
-
-        while let Some((offset, character)) = chars.next() {
-            match character {
-                '"' => {
-                    if let Some((trailing_offset, _)) =
-                        chars.find(|(_, trailing)| !trailing.is_whitespace())
-                    {
-                        return Err(Diagnostic::new(
-                            location.line,
-                            location.column + trailing_offset,
-                            "unexpected text after quoted string",
-                            "put the entire value inside one pair of double quotes.",
-                        ));
-                    }
-                    return Ok(result);
-                }
-                '\\' => {
-                    let Some((escape_offset, escaped)) = chars.next() else {
-                        return Err(Diagnostic::new(
-                            location.line,
-                            location.column + offset,
-                            "incomplete escape sequence",
-                            "use `\\\\`, `\\\"`, `\\n`, `\\r` or `\\t`.",
-                        ));
-                    };
-                    match escaped {
-                        '\\' => result.push('\\'),
-                        '"' => result.push('"'),
-                        'n' => result.push('\n'),
-                        'r' => result.push('\r'),
-                        't' => result.push('\t'),
-                        _ => {
-                            return Err(Diagnostic::new(
-                                location.line,
-                                location.column + escape_offset,
-                                format!("unsupported escape sequence `\\{escaped}`"),
-                                "use `\\\\`, `\\\"`, `\\n`, `\\r` or `\\t`.",
-                            ));
-                        }
-                    }
-                }
-                character => result.push(character),
-            }
-        }
-
-        return Err(Diagnostic::new(
-            location.line,
-            location.column,
-            "quoted string is not closed",
-            "close the string with `\"` on the same line.",
-        ));
-    }
-
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_./:+-".contains(character))
-    {
-        return Ok(value.to_owned());
-    }
-
-    let invalid_offset = value
-        .chars()
-        .take_while(|character| character.is_ascii_alphanumeric() || "_./:+-".contains(*character))
-        .count();
-    Err(Diagnostic::new(
-        location.line,
-        location.column + invalid_offset,
-        format!("cannot read `{value}` as a value"),
-        "use one unquoted atom, a double-quoted string, or a list such as `[rust, cargo]`.",
-    ))
 }
 
 fn strip_comment(text: &str) -> &str {
@@ -669,7 +557,14 @@ pub fn parse(source: &str) -> Result<Package, Diagnostic> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Diagnostic, Value, parse};
+    use super::{Diagnostic, Located, SourceLocation, Value, parse};
+
+    fn string_item(value: &str, line: usize, column: usize) -> Located<Value> {
+        Located {
+            value: Value::String(value.to_owned()),
+            location: SourceLocation { line, column },
+        }
+    }
 
     #[test]
     fn parses_nested_fields_and_inline_dependency_lists() {
@@ -677,8 +572,8 @@ mod tests {
             r#"package vim:
   version: "9.1"
   dependencies:
-    build: [gcc, make, ncurses]
-    runtime: [ncurses]
+    build: ["gcc", "make", "ncurses"]
+    runtime: ["ncurses"]
 "#,
         )
         .expect("valid package should parse");
@@ -690,27 +585,9 @@ mod tests {
         assert_eq!(
             dependencies["build"].value,
             Value::List(vec![
-                super::Located {
-                    value: "gcc".to_owned(),
-                    location: super::SourceLocation {
-                        line: 4,
-                        column: 13
-                    },
-                },
-                super::Located {
-                    value: "make".to_owned(),
-                    location: super::SourceLocation {
-                        line: 4,
-                        column: 18
-                    },
-                },
-                super::Located {
-                    value: "ncurses".to_owned(),
-                    location: super::SourceLocation {
-                        line: 4,
-                        column: 24
-                    },
-                },
+                string_item("gcc", 4, 13),
+                string_item("make", 4, 20),
+                string_item("ncurses", 4, 28),
             ])
         );
     }
@@ -734,14 +611,8 @@ mod tests {
         assert_eq!(
             build["commands"].value,
             Value::List(vec![
-                super::Located {
-                    value: "echo a,b".to_owned(),
-                    location: super::SourceLocation { line: 4, column: 7 },
-                },
-                super::Located {
-                    value: "make".to_owned(),
-                    location: super::SourceLocation { line: 5, column: 7 },
-                },
+                string_item("echo a,b", 4, 7),
+                string_item("make", 5, 7),
             ])
         );
     }
@@ -752,8 +623,8 @@ mod tests {
             r#"   # oddly indented comment-only line
 package demo: # package comment
   url: "https://example.test/archive#source" # trailing comment
-  dependencies: [one, two] # another comment
-  labels: ["alpha#beta", gamma]
+  dependencies: ["one", "two"] # another comment
+  labels: ["alpha#beta", "gamma"]
 "#,
         )
         .expect("comments and quoted hashes should parse");
@@ -765,47 +636,21 @@ package demo: # package comment
         assert_eq!(
             package.fields["labels"].value,
             Value::List(vec![
-                super::Located {
-                    value: "alpha#beta".to_owned(),
-                    location: super::SourceLocation {
-                        line: 5,
-                        column: 12
-                    },
-                },
-                super::Located {
-                    value: "gamma".to_owned(),
-                    location: super::SourceLocation {
-                        line: 5,
-                        column: 26
-                    },
-                },
+                string_item("alpha#beta", 5, 12),
+                string_item("gamma", 5, 26),
             ])
         );
     }
 
     #[test]
     fn parses_empty_lists_trailing_commas_and_crlf() {
-        let package = parse("package demo:\r\n  dependencies: [one, two,]\r\n  optional: []\r\n")
-            .expect("CRLF, trailing commas, and empty lists should parse");
+        let package =
+            parse("package demo:\r\n  dependencies: [\"one\", \"two\",]\r\n  optional: []\r\n")
+                .expect("CRLF, trailing commas, and empty lists should parse");
 
         assert_eq!(
             package.fields["dependencies"].value,
-            Value::List(vec![
-                super::Located {
-                    value: "one".to_owned(),
-                    location: super::SourceLocation {
-                        line: 2,
-                        column: 18
-                    },
-                },
-                super::Located {
-                    value: "two".to_owned(),
-                    location: super::SourceLocation {
-                        line: 2,
-                        column: 23
-                    },
-                },
-            ])
+            Value::List(vec![string_item("one", 2, 18), string_item("two", 2, 25),])
         );
         assert_eq!(package.fields["optional"].value, Value::List(vec![]));
     }
@@ -843,15 +688,15 @@ package demo: # package comment
             Diagnostic {
                 line: 2,
                 column: 17,
-                message: "unexpected text after quoted string".to_owned(),
-                help: "put the entire value inside one pair of double quotes.".to_owned(),
+                message: "unexpected token after expression".to_owned(),
+                help: "remove the extra token or add an operator between values.".to_owned(),
             }
         );
     }
 
     #[test]
     fn reports_unclosed_list_and_string_separately() {
-        let list_error = parse("package demo:\n  dependencies: [one, two\n")
+        let list_error = parse("package demo:\n  dependencies: [\"one\", \"two\"\n")
             .expect_err("unclosed list should fail");
         assert!(list_error.message.contains("missing its closing"));
 
@@ -861,17 +706,20 @@ package demo: # package comment
     }
 
     #[test]
-    fn rejects_trailing_list_comma_without_an_item() {
-        let error = parse("package demo:\n  dependencies: [one,,]\n")
+    fn rejects_empty_list_items() {
+        let error = parse("package demo:\n  dependencies: [\"one\",,]\n")
             .expect_err("empty list entries should fail");
-        assert!(error.message.contains("expected a list item"));
+        assert!(error.message.contains("expected a value or expression"));
     }
 
     #[test]
-    fn rejects_nested_lists() {
-        let error = parse("package demo:\n  dependencies: [one, [two]]\n")
-            .expect_err("nested lists are not part of the initial language");
-        assert!(error.message.contains("nested lists are not supported"));
+    fn parses_nested_lists() {
+        let package = parse("package demo:\n  groups: [[\"one\"], [\"two\"]]\n")
+            .expect("nested lists should parse");
+        let Value::List(groups) = &package.fields["groups"].value else {
+            panic!("groups should be a list");
+        };
+        assert!(matches!(groups[0].value, Value::List(_)));
     }
 
     #[test]
@@ -900,9 +748,9 @@ package demo: # package comment
         let package = parse(
             "package demo:\n\
              \x20\x20source:\n\
-             \x20\x20\x20\x20url: source-url\n\
+            \x20\x20\x20\x20url: \"source-url\"\n\
              \x20\x20homepage:\n\
-             \x20\x20\x20\x20url: home-url\n",
+            \x20\x20\x20\x20url: \"home-url\"\n",
         )
         .expect("field names are only unique within their own mapping");
 
@@ -927,7 +775,7 @@ package demo: # package comment
         assert!(
             quote_error
                 .message
-                .contains("unexpected text after quoted string")
+                .contains("unexpected token after expression")
         );
 
         let escape_error = parse("package demo:\n  version: \"invalid\\x\"\n")
@@ -973,25 +821,154 @@ package demo: # package comment
 
     #[test]
     fn renders_actionable_diagnostics() {
-        let error =
-            parse("package demo:\n  values: [one two]\n").expect_err("missing comma should fail");
-        assert_eq!(
-            error.render("demo.sw"),
-            "demo.sw:2:15: error: cannot read `one two` as a value\n  help: use one unquoted atom, a double-quoted string, or a list such as `[rust, cargo]`."
-        );
+        let error = parse("package demo:\n  values: [\"one\" \"two\"]\n")
+            .expect_err("missing comma should fail");
+        assert!(error.message.contains("expected `,` between list items"));
+        assert!(error.render("demo.sw").starts_with("demo.sw:2:"));
+        assert!(!error.help.is_empty());
     }
 
     #[test]
     fn allows_a_trailing_comma_but_rejects_empty_list_entries() {
-        let package = parse("package demo:\n  dependencies: [one, two,]\n")
+        let package = parse("package demo:\n  dependencies: [\"one\", \"two\",]\n")
             .expect("a trailing comma should be allowed");
         assert!(matches!(
             package.fields["dependencies"].value,
             Value::List(_)
         ));
 
-        let error = parse("package demo:\n  dependencies: [one,,two]\n")
+        let error = parse("package demo:\n  dependencies: [\"one\",,\"two\"]\n")
             .expect_err("empty list entries should fail");
-        assert!(error.message.contains("expected a list item"));
+        assert!(error.message.contains("expected a value or expression"));
+    }
+
+    #[test]
+    fn evaluates_let_bindings_types_operators_lists_and_interpolation() {
+        let package = parse(
+            r#"let:
+  name: "Swaraj"
+  version: "${major}.${minor}"
+  major: 0
+  minor: 1
+  enabled: true
+  count: 2 + 3 * 4
+  features: ["parser", "evaluator"]
+  allFeatures: features ++ ["interpolation"]
+  ready: enabled && count == 14
+  release: if ready then "${name} ${version}" else "disabled"
+in:
+package swaraj:
+  version: release
+  enabled: enabled
+  count: count
+  features: allFeatures
+"#,
+        )
+        .expect("the initial expression features should evaluate");
+
+        assert_eq!(
+            package.fields["version"].value,
+            Value::String("Swaraj 0.1".to_owned())
+        );
+        assert_eq!(package.fields["enabled"].value, Value::Boolean(true));
+        assert_eq!(package.fields["count"].value, Value::Integer(14));
+        assert_eq!(
+            package.fields["features"].value,
+            Value::List(vec![
+                string_item("parser", 8, 14),
+                string_item("evaluator", 8, 24),
+                string_item("interpolation", 9, 29),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_forward_references_and_does_not_evaluate_unused_bindings() {
+        let package = parse(
+            r#"let:
+  first: second + 1
+  second: 41
+  unused: missingName
+in:
+package demo:
+  answer: first
+"#,
+        )
+        .expect("forward references and unused bindings should be allowed");
+        assert_eq!(package.fields["answer"].value, Value::Integer(42));
+    }
+
+    #[test]
+    fn short_circuits_boolean_operators_and_conditionals() {
+        let package = parse(
+            r#"let:
+  safeAnd: false && missing
+  safeOr: true || missing
+  chosen: if true then "yes" else missing
+in:
+package demo:
+  and: safeAnd
+  or: safeOr
+  chosen: chosen
+"#,
+        )
+        .expect("unselected short-circuit branches should not be evaluated");
+        assert_eq!(package.fields["and"].value, Value::Boolean(false));
+        assert_eq!(package.fields["or"].value, Value::Boolean(true));
+        assert_eq!(
+            package.fields["chosen"].value,
+            Value::String("yes".to_owned())
+        );
+    }
+
+    #[test]
+    fn equality_ignores_source_locations_inside_lists() {
+        let package = parse(
+            r#"let:
+  equal: ["same"] == ["same"]
+in:
+package demo:
+  equal: equal
+"#,
+        )
+        .expect("equal lists should evaluate");
+        assert_eq!(package.fields["equal"].value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn reports_undefined_variables_cycles_type_errors_and_division_by_zero() {
+        let undefined =
+            parse("package demo:\n  value: missing\n").expect_err("unknown variables should fail");
+        assert!(undefined.message.contains("undefined variable `missing`"));
+
+        let cycle =
+            parse("let:\n  first: second\n  second: first\nin:\npackage demo:\n  value: first\n")
+                .expect_err("recursive bindings should fail");
+        assert!(cycle.message.contains("recursive definition"));
+
+        let type_error = parse("package demo:\n  value: true + 1\n")
+            .expect_err("invalid operand types should fail");
+        assert!(type_error.message.contains("expects integers"));
+
+        let division =
+            parse("package demo:\n  value: 10 / 0\n").expect_err("division by zero should fail");
+        assert!(division.message.contains("division by zero"));
+    }
+
+    #[test]
+    fn permits_trailing_commas_in_binding_and_nested_expression_lists() {
+        let package = parse(
+            r#"let:
+  items: [
+    ["one", "two",],
+    ["three"],
+  ]
+in:
+package demo:
+  items: items
+"#,
+        )
+        .expect("multiline nested lists and trailing commas should parse");
+        assert!(matches!(package.fields["items"].value, Value::List(_)));
     }
 }

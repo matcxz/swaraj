@@ -66,7 +66,7 @@ fn reports_syntax_errors_and_continues_checking_other_files() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains(&format!("{}:2:15: error:", invalid.display())));
+    assert!(stderr.contains(&format!("{}:2:16: error:", invalid.display())));
     assert!(stderr.contains("help:"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("valid package `healthy`"));
 }

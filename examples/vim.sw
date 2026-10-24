@@ -6,8 +6,8 @@ package vim:
     sha256: "HASH_A_DEFINIR"
 
   dependencies:
-    build: [gcc, make, ncurses]
-    runtime: [ncurses]
+    build: ["gcc", "make", "ncurses"]
+    runtime: ["ncurses"]
 
   build:
     commands: [

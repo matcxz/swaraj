@@ -7,23 +7,23 @@ package emacs:
 
   dependencies:
     build: [
-      gcc,
-      make,
-      pkg-config,
-      gnutls,
-      ncurses,
-      libx11,
-      gtk3,
-      tree-sitter,
-      libgccjit
+      "gcc",
+      "make",
+      "pkg-config",
+      "gnutls",
+      "ncurses",
+      "libx11",
+      "gtk3",
+      "tree-sitter",
+      "libgccjit"
     ]
     runtime: [
-      gnutls,
-      ncurses,
-      libx11,
-      gtk3,
-      tree-sitter,
-      libgccjit
+      "gnutls",
+      "ncurses",
+      "libx11",
+      "gtk3",
+      "tree-sitter",
+      "libgccjit"
     ]
 
   build:
