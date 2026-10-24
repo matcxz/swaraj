@@ -6,7 +6,7 @@ It provides a parser, expression evaluator, and command-line checker.
 ```text
 let:
   major: 9
-  minor: 1
+  minor: 0
   increment: value: value + 1
   nextMinor: increment minor
   version: "${major}.${nextMinor}"
@@ -19,8 +19,8 @@ package vim:
   version: version
   metadata: metadata // { editor = true; }
   source:
-    url: "https://example.org/vim-${version}.tar.gz"
-    sha256: "REPLACE_WITH_A_REAL_HASH"
+    url: "https://github.com/vim/vim/archive/refs/tags/v9.1.0000.tar.gz"
+    sha256: "8d2a74e358be9cf260174e15e2e29dba4773f2670718b5bf728db6f54b90e25d"
   dependencies:
     build: ["gcc", "make"]
     runtime: ["ncurses"]
@@ -53,6 +53,9 @@ imported package fields, along with `packageName`. `builtins.readFile` and
 include source locations and correction hints. The parser API preserves
 locations in the resulting syntax tree; `parse_with_path` enables relative
 file operations.
+
+Package field requirements and accepted types are described in
+[the package schema](docs/package-schema.md).
 
 Swaraj has its own syntax and semantics and does not claim full Nix or Guix
 language compatibility. Floating-point values and multiple package

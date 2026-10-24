@@ -36,8 +36,8 @@ fn prints_help_and_version() {
 
 #[test]
 fn checks_multiple_files_in_one_invocation() {
-    let first = write_temp_source("package first:\n  version: 1\n");
-    let second = write_temp_source("package second:\n  version: 2\n");
+    let first = write_temp_source("package first:\n  version: \"1\"\n");
+    let second = write_temp_source("package second:\n  version: \"2\"\n");
     let output = run(&[
         "check",
         first.to_str().expect("temporary path should be UTF-8"),
@@ -50,6 +50,18 @@ fn checks_multiple_files_in_one_invocation() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("valid package `first`"));
     assert!(stdout.contains("valid package `second`"));
+}
+
+#[test]
+fn validates_hello_package_without_executing_it() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello.sw");
+    let output = run(&[
+        "check",
+        path.to_str().expect("example path should be UTF-8"),
+    ]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("valid package `hello`"));
 }
 
 #[test]
@@ -76,7 +88,7 @@ fn checks_packages_with_relative_imports() {
 #[test]
 fn reports_syntax_errors_and_continues_checking_other_files() {
     let invalid = write_temp_source("package broken:\n  values: [one,,two]\n");
-    let valid = write_temp_source("package healthy:\n  version: 1\n");
+    let valid = write_temp_source("package healthy:\n  version: \"1\"\n");
     let output = run(&[
         "check",
         invalid.to_str().expect("temporary path should be UTF-8"),
@@ -90,6 +102,21 @@ fn reports_syntax_errors_and_continues_checking_other_files() {
     assert!(stderr.contains(&format!("{}:2:16: error:", invalid.display())));
     assert!(stderr.contains("help:"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("valid package `healthy`"));
+}
+
+#[test]
+fn reports_package_schema_errors_with_source_locations() {
+    let invalid = write_temp_source("package incomplete:\n  description: \"No version\"\n");
+    let output = run(&[
+        "check",
+        invalid.to_str().expect("temporary path should be UTF-8"),
+    ]);
+    let _ = fs::remove_file(&invalid);
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("package is missing the required `version` field"));
+    assert!(stderr.contains(":1:9: error:"));
 }
 
 #[test]

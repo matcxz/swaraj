@@ -3,7 +3,7 @@ package emacs:
 
   source:
     url: "https://ftp.gnu.org/gnu/emacs/emacs-30.2.tar.xz"
-    sha256: "HASH_A_DEFINIR"
+    sha256: "b3f36f18a6dd2715713370166257de2fae01f9d38cfe878ced9b1e6ded5befd9"
 
   dependencies:
     build: [

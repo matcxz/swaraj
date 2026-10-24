@@ -277,6 +277,8 @@ impl<'a> Parser<'a> {
             ));
         }
 
+        validate_package_fields(&fields, package_location)?;
+
         Ok(Package {
             name: package_name,
             location: package_location,
@@ -586,6 +588,234 @@ fn is_identifier(value: &str) -> bool {
         })
 }
 
+fn validate_package_fields(
+    fields: &BTreeMap<String, Located<Value>>,
+    package_location: SourceLocation,
+) -> Result<(), Diagnostic> {
+    let version = fields.get("version").ok_or_else(|| {
+        Diagnostic::new(
+            package_location.line,
+            package_location.column,
+            "package is missing the required `version` field",
+            "add a non-empty string version, for example `version: \"1.0\"`.",
+        )
+    })?;
+    validate_non_empty_string(version, "version")?;
+
+    if let Some(description) = fields.get("description") {
+        validate_non_empty_string(description, "description")?;
+    }
+    if let Some(source) = fields.get("source") {
+        validate_source(source)?;
+    }
+    if let Some(dependencies) = fields.get("dependencies") {
+        validate_dependencies(dependencies)?;
+    }
+    for name in ["build", "install"] {
+        if let Some(phase) = fields.get(name) {
+            validate_commands(phase, name)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_string(field: &Located<Value>, name: &str) -> Result<(), Diagnostic> {
+    match &field.value {
+        Value::String(value) if !value.trim().is_empty() => Ok(()),
+        Value::String(_) => Err(schema_error(
+            field.location,
+            name,
+            "must not be empty",
+            "provide a non-empty string.",
+        )),
+        _ => Err(schema_error(
+            field.location,
+            name,
+            "must be a string",
+            "use a quoted string value.",
+        )),
+    }
+}
+
+fn validate_source(source: &Located<Value>) -> Result<(), Diagnostic> {
+    let Value::Map(fields) = &source.value else {
+        return Err(schema_error(
+            source.location,
+            "source",
+            "must be a mapping",
+            "use `source:` with indented `url` and `sha256` fields.",
+        ));
+    };
+    let url = fields.get("url").ok_or_else(|| {
+        schema_error(
+            source.location,
+            "source.url",
+            "is required when `source` is provided",
+            "add a non-empty source locator.",
+        )
+    })?;
+    let url_value = match &url.value {
+        Value::String(value) if !value.trim().is_empty() => value,
+        Value::String(_) => {
+            return Err(schema_error(
+                url.location,
+                "source.url",
+                "must not be empty",
+                "provide a non-empty absolute source URI.",
+            ));
+        }
+        _ => {
+            return Err(schema_error(
+                url.location,
+                "source.url",
+                "must be a string",
+                "use a quoted absolute source URI.",
+            ));
+        }
+    };
+    if !has_uri_scheme(url_value) {
+        return Err(schema_error(
+            url.location,
+            "source.url",
+            "must be an absolute URI with a scheme",
+            "use a source URI such as `https://...`, `file://...`, or `ipfs://...`.",
+        ));
+    }
+
+    let checksum = fields.get("sha256").ok_or_else(|| {
+        schema_error(
+            source.location,
+            "source.sha256",
+            "is required when `source` is provided",
+            "add the source archive's 64-character SHA-256 checksum.",
+        )
+    })?;
+    match &checksum.value {
+        Value::String(value)
+            if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Ok(())
+        }
+        Value::String(_) => Err(schema_error(
+            checksum.location,
+            "source.sha256",
+            "must contain exactly 64 hexadecimal characters",
+            "replace the placeholder with the archive's SHA-256 checksum.",
+        )),
+        _ => Err(schema_error(
+            checksum.location,
+            "source.sha256",
+            "must be a string",
+            "use a quoted 64-character hexadecimal SHA-256 checksum.",
+        )),
+    }
+}
+
+fn validate_dependencies(dependencies: &Located<Value>) -> Result<(), Diagnostic> {
+    match &dependencies.value {
+        Value::List(items) => validate_string_list(items, "dependencies"),
+        Value::Map(groups) => {
+            for (group_name, group) in groups {
+                if !matches!(group_name.as_str(), "build" | "runtime") {
+                    return Err(schema_error(
+                        group.location,
+                        &format!("dependencies.{group_name}"),
+                        "is not a supported dependency group",
+                        "use `build` or `runtime` dependency groups.",
+                    ));
+                }
+                let Value::List(items) = &group.value else {
+                    return Err(schema_error(
+                        group.location,
+                        &format!("dependencies.{group_name}"),
+                        "must be a list of package names",
+                        "use a list of quoted dependency names.",
+                    ));
+                };
+                validate_string_list(items, &format!("dependencies.{group_name}"))?;
+            }
+            Ok(())
+        }
+        _ => Err(schema_error(
+            dependencies.location,
+            "dependencies",
+            "must be a list or a mapping of dependency groups",
+            "use a list of names or `build` and `runtime` lists.",
+        )),
+    }
+}
+
+fn validate_commands(phase: &Located<Value>, phase_name: &str) -> Result<(), Diagnostic> {
+    let Value::Map(fields) = &phase.value else {
+        return Err(schema_error(
+            phase.location,
+            phase_name,
+            "must be a mapping containing `commands`",
+            "use an indented `commands` list of quoted command strings.",
+        ));
+    };
+    let commands = fields.get("commands").ok_or_else(|| {
+        schema_error(
+            phase.location,
+            &format!("{phase_name}.commands"),
+            "is required",
+            "add a non-empty list of command strings.",
+        )
+    })?;
+    let Value::List(items) = &commands.value else {
+        return Err(schema_error(
+            commands.location,
+            &format!("{phase_name}.commands"),
+            "must be a list of command strings",
+            "use a list of quoted command strings.",
+        ));
+    };
+    if items.is_empty() {
+        return Err(schema_error(
+            commands.location,
+            &format!("{phase_name}.commands"),
+            "must not be empty",
+            "add at least one command string.",
+        ));
+    }
+    validate_string_list(items, &format!("{phase_name}.commands"))
+}
+
+fn validate_string_list(items: &[Located<Value>], field_name: &str) -> Result<(), Diagnostic> {
+    for item in items {
+        validate_non_empty_string(item, field_name)?;
+    }
+    Ok(())
+}
+
+fn has_uri_scheme(value: &str) -> bool {
+    let Some((scheme, remainder)) = value.split_once(':') else {
+        return false;
+    };
+    let mut characters = scheme.chars();
+    matches!(characters.next(), Some(character) if character.is_ascii_alphabetic())
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '+' | '.' | '-')
+        })
+        && !remainder.trim().is_empty()
+        && !value.chars().any(char::is_whitespace)
+}
+
+fn schema_error(
+    location: SourceLocation,
+    field_name: &str,
+    message: &str,
+    help: &str,
+) -> Diagnostic {
+    Diagnostic::new(
+        location.line,
+        location.column,
+        format!("invalid `{field_name}`: {message}"),
+        help,
+    )
+}
+
 fn reject_function_values(value: Value, location: SourceLocation) -> Result<Value, Diagnostic> {
     let contains_function = match &value {
         Value::Function(_) => true,
@@ -796,6 +1026,7 @@ mod tests {
       "echo a,b",
       "make"
     ]
+  version: "1.0"
 "#,
         )
         .expect("valid package should parse");
@@ -820,6 +1051,7 @@ package demo: # package comment
   url: "https://example.test/archive#source" # trailing comment
   dependencies: ["one", "two"] # another comment
   labels: ["alpha#beta", "gamma"]
+  version: "1.0"
 "#,
         )
         .expect("comments and quoted hashes should parse");
@@ -839,8 +1071,9 @@ package demo: # package comment
 
     #[test]
     fn parses_empty_lists_trailing_commas_and_crlf() {
-        let package =
-            parse("package demo:\r\n  dependencies: [\"one\", \"two\",]\r\n  optional: []\r\n")
+        let package = parse(
+            "package demo:\r\n  dependencies: [\"one\", \"two\",]\r\n  optional: []\r\n  version: \"1.0\"\r\n",
+        )
                 .expect("CRLF, trailing commas, and empty lists should parse");
 
         assert_eq!(
@@ -855,6 +1088,7 @@ package demo: # package comment
         let package = parse(
             r#"package demo:
   text: "café says \"hello\"\nline"
+  version: "1.0"
 "#,
         )
         .expect("escaped strings and Unicode should parse");
@@ -909,8 +1143,9 @@ package demo: # package comment
 
     #[test]
     fn parses_nested_lists() {
-        let package = parse("package demo:\n  groups: [[\"one\"], [\"two\"]]\n")
-            .expect("nested lists should parse");
+        let package =
+            parse("package demo:\n  groups: [[\"one\"], [\"two\"]]\n  version: \"1.0\"\n")
+                .expect("nested lists should parse");
         let Value::List(groups) = &package.fields["groups"].value else {
             panic!("groups should be a list");
         };
@@ -939,13 +1174,82 @@ package demo: # package comment
     }
 
     #[test]
+    fn validates_package_schema_and_preserves_extension_fields() {
+        let package = parse(
+            r#"package demo:
+  version: "1.0"
+  description: "Demo package"
+  source:
+    url: "https://example.test/demo.tar.gz"
+    sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  dependencies:
+    build: ["compiler"]
+    runtime: ["library"]
+  build:
+    commands: ["make"]
+  install:
+    commands: ["make install"]
+  metadata: { maintainers = ["team"]; }
+"#,
+        )
+        .expect("a package following the core schema should validate");
+        assert!(package.fields.contains_key("metadata"));
+
+        let errors = [
+            (
+                "package demo:\n  description: \"missing version\"\n",
+                "required `version`",
+            ),
+            ("package demo:\n  version: \"\"\n", "invalid `version`"),
+            (
+                "package demo:\n  version: true\n",
+                "invalid `version`: must be a string",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  source:\n    url: \"relative/archive.tar.gz\"\n    sha256: \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n",
+                "absolute URI",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  source:\n    url: \"https://example.test/archive.tar.gz\"\n",
+                "source.sha256",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  source:\n    url: \"https://example.test/a.tar.gz\"\n    sha256: \"not-a-checksum\"\n",
+                "64 hexadecimal characters",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  dependencies: { build = \"compiler\"; }\n",
+                "must be a list of package names",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  build: { }\n",
+                "build.commands",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  dependencies: [\"\", \"library\"]\n",
+                "invalid `dependencies`",
+            ),
+            (
+                "package demo:\n  version: \"1.0\"\n  build:\n    commands: []\n",
+                "must not be empty",
+            ),
+        ];
+        for (source, expected) in errors {
+            let error = parse(source).expect_err("invalid package schema should be rejected");
+            assert!(error.message.contains(expected), "{error:?}");
+        }
+    }
+
+    #[test]
     fn permits_same_field_names_in_separate_mappings() {
         let package = parse(
             "package demo:\n\
              \x20\x20source:\n\
-            \x20\x20\x20\x20url: \"source-url\"\n\
+            \x20\x20\x20\x20url: \"https://source-url\"\n\
+            \x20\x20\x20\x20sha256: \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"\n\
              \x20\x20homepage:\n\
-            \x20\x20\x20\x20url: \"home-url\"\n",
+            \x20\x20\x20\x20url: \"home-url\"\n\
+             \x20\x20version: \"1.0\"\n",
         )
         .expect("field names are only unique within their own mapping");
 
@@ -955,7 +1259,10 @@ package demo: # package comment
         let Value::Map(homepage) = &package.fields["homepage"].value else {
             panic!("homepage should be a mapping");
         };
-        assert_eq!(source["url"].value, Value::String("source-url".to_owned()));
+        assert_eq!(
+            source["url"].value,
+            Value::String("https://source-url".to_owned())
+        );
         assert_eq!(homepage["url"].value, Value::String("home-url".to_owned()));
     }
 
@@ -1030,8 +1337,9 @@ package demo: # package comment
 
     #[test]
     fn allows_a_trailing_comma_but_rejects_empty_list_entries() {
-        let package = parse("package demo:\n  dependencies: [\"one\", \"two\",]\n")
-            .expect("a trailing comma should be allowed");
+        let package =
+            parse("package demo:\n  dependencies: [\"one\", \"two\",]\n  version: \"1.0\"\n")
+                .expect("a trailing comma should be allowed");
         assert!(matches!(
             package.fields["dependencies"].value,
             Value::List(_)
@@ -1191,6 +1499,7 @@ package demo:
 in:
 package demo:
   result: math.factorial 6
+  version: "1.0"
 "#,
         )
         .expect("recursive functions in recursive sets should evaluate");
@@ -1304,6 +1613,7 @@ package app:
 in:
 package demo:
   answer: answer
+  version: "1.0"
 "#,
         )
         .expect("lambda bindings and function application should evaluate");
@@ -1325,6 +1635,7 @@ package demo:
   answer: apply addFive 27
   shadowed: shadow 3
   values: values
+  version: "1.0"
 "#,
         )
         .expect("closures should capture lexical bindings and be first-class");
@@ -1385,6 +1696,7 @@ package demo:
   mappedAttributes: builtins.mapAttrs (name: value: value + 1) metadata
   filteredAttributes: builtins.filterAttrs (name: value: name == "a") metadata
   fromList: builtins.listToAttrs [{ name = "answer"; value = 42; }]
+  version: "1.0"
 "#,
         )
         .expect("supported built-ins should evaluate");
@@ -1514,6 +1826,7 @@ package demo:
 in:
 package demo:
   answer: first
+  version: "1.0"
 "#,
         )
         .expect("forward references and unused bindings should be allowed");
@@ -1532,6 +1845,7 @@ package demo:
   and: safeAnd
   or: safeOr
   chosen: chosen
+  version: "1.0"
 "#,
         )
         .expect("unselected short-circuit branches should not be evaluated");
@@ -1551,6 +1865,7 @@ package demo:
 in:
 package demo:
   equal: equal
+  version: "1.0"
 "#,
         )
         .expect("equal lists should evaluate");
@@ -1588,6 +1903,7 @@ package demo:
 in:
 package demo:
   items: items
+  version: "1.0"
 "#,
         )
         .expect("multiline nested lists and trailing commas should parse");

@@ -3,7 +3,7 @@ package vim:
 
   source:
     url: "https://github.com/vim/vim/archive/refs/tags/v9.1.0000.tar.gz"
-    sha256: "HASH_A_DEFINIR"
+    sha256: "8d2a74e358be9cf260174e15e2e29dba4773f2670718b5bf728db6f54b90e25d"
 
   dependencies:
     build: ["gcc", "make", "ncurses"]
