@@ -99,7 +99,9 @@ swaraj check examples/vim.sw examples/emacs.sw
 
 The flake pins the Nix development environment and provides Rust, Cargo,
 rustfmt, Clippy, and rust-analyzer. The Rust parser currently has no
-third-party crate dependencies.
+third-party crate dependencies. Flake outputs are available for x86_64 Linux,
+aarch64 Linux, and Apple Silicon macOS; the Rust source itself uses only the
+standard library.
 
 ```sh
 nix develop
