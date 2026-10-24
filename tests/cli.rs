@@ -53,8 +53,29 @@ fn checks_multiple_files_in_one_invocation() {
 }
 
 #[test]
+fn checks_packages_with_relative_imports() {
+    let imported = write_temp_source("package base:\n  version: \"1.0\"\n");
+    let imported_name = imported
+        .file_name()
+        .expect("temporary file should have a name")
+        .to_string_lossy();
+    let root = write_temp_source(&format!(
+        "let:\n  base: builtins.import \"{imported_name}\"\nin:\npackage app:\n  version: base.version\n"
+    ));
+    let output = run(&[
+        "check",
+        root.to_str().expect("temporary path should be UTF-8"),
+    ]);
+    let _ = fs::remove_file(&root);
+    let _ = fs::remove_file(&imported);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("valid package `app`"));
+}
+
+#[test]
 fn reports_syntax_errors_and_continues_checking_other_files() {
-    let invalid = write_temp_source("package broken:\n  values: [one two]\n");
+    let invalid = write_temp_source("package broken:\n  values: [one,,two]\n");
     let valid = write_temp_source("package healthy:\n  version: 1\n");
     let output = run(&[
         "check",

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
 
-use swaraj::parse;
+use swaraj::parse_with_path;
 
 const USAGE: &str = "\
 Swaraj - validate declarative package definitions
@@ -31,7 +31,7 @@ fn run(args: &[OsString]) -> Result<(), (u8, String)> {
             for path in paths {
                 let path = Path::new(path);
                 match fs::read_to_string(path) {
-                    Ok(source) => match parse(&source) {
+                    Ok(source) => match parse_with_path(&source, path) {
                         Ok(package) => {
                             println!("{}: valid package `{}`", path.display(), package.name)
                         }

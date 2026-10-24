@@ -1,117 +1,102 @@
 # Swaraj
 
-Swaraj is free software licensed under the GNU General Public License
-version 3. See [LICENSE](LICENSE) for details.
-
-Swaraj is an independent, declarative language for describing package
-definitions. This repository contains its initial Rust implementation: a
-parser, expression evaluator, syntax-checking command, and examples. It does
-not download, build, or install software. The language is experimental and
-does not claim compatibility with Nix or Guix.
-
-The design aims to keep package definitions readable while supporting reusable
-values and predictable evaluation. Fields are indented, lists use square
-brackets, and strings use double quotes.
-
-## Example
+Swaraj is a declarative language for package definitions, implemented in Rust.
+It provides a parser, expression evaluator, and command-line checker.
 
 ```text
 let:
   major: 9
   minor: 1
-  version: "${major}.${minor}"
-  optionalFeatures: ["clipboard", "terminal"]
-  features: optionalFeatures ++ ["multibyte"]
-  useNativeBuild: true
+  increment: value: value + 1
+  nextMinor: increment minor
+  version: "${major}.${nextMinor}"
+  metadata: {
+    name = "Vim";
+    version = version;
+  }
 in:
 package vim:
   version: version
-  features: features
+  metadata: metadata // { editor = true; }
   source:
     url: "https://example.org/vim-${version}.tar.gz"
     sha256: "REPLACE_WITH_A_REAL_HASH"
   dependencies:
     build: ["gcc", "make"]
     runtime: ["ncurses"]
-  build:
-    commands: [
-      "./configure --with-features=huge",
-      "make"
-    ]
 ```
 
-The examples in `examples/` demonstrate the current syntax. Their source
-hashes are placeholders; they are syntax examples, not verified package
-recipes.
+## Language
 
-## Syntax and evaluation
+Swaraj supports package declarations, indented fields, nested maps, lists,
+`let:` bindings, curried functions, strings with interpolation,
+integers, booleans, conditionals, and arithmetic and boolean operators.
+Attribute sets support field selection (`set.name`), existence checks
+(`set ? name`), fallback selection (`set.name or default`), and merging
+(`left // right`).
+Recursive attribute sets use `rec { name = value; }`; fields are evaluated on
+demand, and circular references are reported.
+A small set of pure built-ins provides `length`, `head`, `tail`, `attrNames`,
+`attrValues`, `toString`, `stringLength`, `substring`, `replaceStrings`,
+`baseNameOf`, `dirOf`, `concatStringsSep`, `concatLists`, `elem`, `hasAttr`,
+`getAttr`, `intersectAttrs`, `removeAttrs`, `map`, `filter`, `foldl'`,
+`genList`, `zipListsWith`, `mapAttrs`, `filterAttrs`, `listToAttrs`,
+`isString`, `isInt`, `isBool`, `isList`, `isAttrs`, `isFunction`, `typeOf`,
+`seq`, and `deepSeq`.
 
-- A file contains exactly one `package name:` declaration, optionally
-  preceded by a `let:` block and terminated by `in:`.
-- Package, field, and binding names start with an ASCII letter or `_`;
-  subsequent characters may also include digits and `-`.
-- Bindings may refer to later bindings. They are evaluated on demand, so
-  unused bindings are not evaluated; recursive references are diagnosed.
-- Each nesting level uses two spaces. Tabs are not allowed for indentation.
-- Blank lines and `#` comments are ignored. A `#` inside a quoted string is
-  ordinary text.
-- Fields use `name: expression`. A field with no inline value introduces a
-  nested mapping. Field names must be unique within their mapping.
-- Values include strings, signed 64-bit integers, booleans (`true` and
-  `false`), lists, and nested mappings.
-- Lists use commas, allow a trailing comma, may span lines, and can contain
-  other lists. Continuation items are indented two spaces below the field;
-  the closing `]` aligns with the field.
-- Strings support `\\`, `\"`, `\n`, `\r`, and `\t` escapes. `${name}`
-  interpolates a string, integer, or boolean binding. Strings stay on one
-  source line.
-- Parentheses group expressions. Operators, from lower to higher precedence:
-  `||`, `&&`, `==` and `!=`, `<` `<=` `>` `>=`, list concatenation `++`,
-  `+` and `-`, `*` `/` and `%`, then unary `!` and `-`.
-- `if condition then value else fallback` is an expression. Boolean
-  operators and conditionals short-circuit.
-- Arithmetic is checked for 64-bit overflow; division or remainder by zero,
-  undefined variables, type mismatches, and recursive bindings produce
-  diagnostics.
-- Mappings may be nested up to 128 levels.
+Bindings may reference later bindings and are evaluated on demand. Functions
+use `parameter: expression` and application syntax `function argument`;
+functions are first-class, capture lexical bindings, and support currying.
+Local package imports use `builtins.import "relative/path.sw"` and expose the
+imported package fields, along with `packageName`. `builtins.readFile` and
+`builtins.pathExists` resolve paths relative to the source file. Diagnostics
+include source locations and correction hints. The parser API preserves
+locations in the resulting syntax tree; `parse_with_path` enables relative
+file operations.
 
-Functions, imports, attribute-set expressions, floating-point numbers,
-built-ins, and multiple package declarations per file are not implemented.
-These are possible future language features, not current guarantees.
+Swaraj has its own syntax and semantics and does not claim full Nix or Guix
+language compatibility. Floating-point values and multiple package
+declarations per file are not supported. Expression nesting and recursive
+evaluation are bounded to prevent unbounded stack use. The checker validates
+definitions but does not download, build, or install software.
 
-## Parser API and command line
-
-The `swaraj` Rust crate exposes `parse(&str)`, returning a `Package` syntax
-tree or a `Diagnostic`. Parsed values, fields, list entries, and package names
-retain one-based source locations. Maps use ordered keys for deterministic
-iteration.
+## Check definitions
 
 ```sh
-nix run . -- check examples/vim.sw examples/emacs.sw examples/expressions.sw
+nix run . -- check \
+  examples/vim.sw \
+  examples/emacs.sw \
+  examples/expressions.sw \
+  examples/imported-base.sw \
+  examples/imports.sw
 ```
 
-The checker reports syntax and evaluation errors with a file, line, column,
-and correction hint. It checks every supplied file and exits unsuccessfully
-if any file cannot be read or parsed.
-
-When the binary is already available on `PATH`, use:
+Or, if `swaraj` is on `PATH`:
 
 ```sh
-swaraj check examples/vim.sw examples/emacs.sw examples/expressions.sw
+swaraj check \
+  examples/vim.sw \
+  examples/emacs.sw \
+  examples/expressions.sw \
+  examples/imported-base.sw \
+  examples/imports.sw
 ```
 
 ## Development
 
-The flake provides Rust, Cargo, rustfmt, Clippy, and rust-analyzer. The Rust
-crate currently has no third-party dependencies.
+The Nix flake provides Rust, Cargo, rustfmt, Clippy, and rust-analyzer.
 
 ```sh
 nix develop
 cargo test
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo run -- check examples/vim.sw examples/emacs.sw examples/expressions.sw
 ```
 
-Flake outputs are available for x86_64 Linux, aarch64 Linux, and Apple Silicon
-macOS. The source uses only the Rust standard library.
+The crate has no third-party dependencies. Flake outputs target x86_64 Linux,
+aarch64 Linux, and Apple Silicon macOS.
+
+## License
+
+Swaraj is licensed under the GNU General Public License version 3. See
+[LICENSE](LICENSE).

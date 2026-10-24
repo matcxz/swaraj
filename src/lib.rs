@@ -3,9 +3,13 @@
 //! A source file contains one package declaration and an indented mapping of
 //! fields. Expressions in fields can use bindings declared in a `let:` block.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 mod expression;
+pub use expression::FunctionValue;
 
 const MAX_NESTING_DEPTH: usize = 128;
 
@@ -40,6 +44,9 @@ pub enum Value {
     List(Vec<Located<Value>>),
     /// A nested mapping of field names to values.
     Map(BTreeMap<String, Located<Value>>),
+    /// A function value. Functions can be used in expressions but not stored
+    /// directly in package definitions.
+    Function(FunctionValue),
 }
 
 /// A parsed package declaration.
@@ -100,10 +107,16 @@ struct SourceLine<'a> {
 struct Parser<'a> {
     lines: Vec<SourceLine<'a>>,
     position: usize,
+    source_path: Option<PathBuf>,
+    import_stack: Rc<RefCell<Vec<PathBuf>>>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(source: &'a str) -> Result<Self, Diagnostic> {
+    fn new(
+        source: &'a str,
+        source_path: Option<PathBuf>,
+        import_stack: Rc<RefCell<Vec<PathBuf>>>,
+    ) -> Result<Self, Diagnostic> {
         let mut lines = Vec::new();
 
         for (index, raw) in source.lines().enumerate() {
@@ -141,7 +154,12 @@ impl<'a> Parser<'a> {
             });
         }
 
-        Ok(Self { lines, position: 0 })
+        Ok(Self {
+            lines,
+            position: 0,
+            source_path,
+            import_stack,
+        })
     }
 
     fn parse(mut self) -> Result<Package, Diagnostic> {
@@ -236,7 +254,12 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        let fields = self.parse_map(2, &bindings)?;
+        let mut evaluator = expression::Evaluator::new(
+            &bindings,
+            self.source_path.as_deref(),
+            self.import_stack.clone(),
+        );
+        let fields = self.parse_map(2, &mut evaluator)?;
         if let Some(line) = self.lines.get(self.position) {
             if line.indent == 0 && line.text.starts_with("package ") {
                 return Err(Diagnostic::new(
@@ -343,7 +366,7 @@ impl<'a> Parser<'a> {
     fn parse_map(
         &mut self,
         indent: usize,
-        bindings: &BTreeMap<String, expression::Expression>,
+        evaluator: &mut expression::Evaluator<'_>,
     ) -> Result<BTreeMap<String, Located<Value>>, Diagnostic> {
         if indent / 2 > MAX_NESTING_DEPTH {
             let line = &self.lines[self.position];
@@ -424,17 +447,17 @@ impl<'a> Parser<'a> {
                         "indent this field exactly two spaces more than its parent.",
                     ));
                 }
-                Value::Map(self.parse_map(indent + 2, bindings)?)
+                Value::Map(self.parse_map(indent + 2, evaluator)?)
             } else {
                 let source = self.collect_expression(&raw_value, indent)?;
                 let parsed = expression::parse(&source, value_location)?;
-                expression::evaluate(&parsed, bindings)?
+                evaluator.evaluate(&parsed)?
             };
 
             fields.insert(
                 key.to_owned(),
                 Located {
-                    value,
+                    value: reject_function_values(value, value_location)?,
                     location: value_location,
                 },
             );
@@ -450,6 +473,7 @@ impl<'a> Parser<'a> {
     ) -> Result<String, Diagnostic> {
         let mut source = initial.to_owned();
         let mut depth = 0usize;
+        let mut map_depth = 0usize;
         let mut quoted = false;
         let mut escaped = false;
         for character in initial.chars() {
@@ -463,23 +487,41 @@ impl<'a> Parser<'a> {
                 depth += 1;
             } else if !quoted && character == ']' {
                 depth = depth.saturating_sub(1);
+            } else if !quoted && character == '{' {
+                map_depth += 1;
+            } else if !quoted && character == '}' {
+                map_depth = map_depth.saturating_sub(1);
             }
         }
-        if depth == 0 {
+        if depth == 0 && map_depth == 0 {
             return Ok(source);
         }
 
-        while depth > 0 {
+        while depth > 0 || map_depth > 0 {
             let Some(next) = self.lines.get(self.position) else {
                 return Ok(source);
             };
-            let is_aligned_closing_line = next.indent == field_indent && next.text.starts_with(']');
-            if !is_aligned_closing_line && next.indent != field_indent + 2 {
+            let is_aligned_closing_line = next.indent == field_indent
+                && (next.text.starts_with(']') || next.text.starts_with('}'));
+            let indentation_is_invalid = if map_depth > 0 {
+                next.indent < field_indent + 2 && !is_aligned_closing_line
+            } else {
+                !is_aligned_closing_line && next.indent != field_indent + 2
+            };
+            if indentation_is_invalid {
                 return Err(Diagnostic::new(
                     next.number,
                     next.indent + 1,
-                    "list continuation has unexpected indentation",
-                    "indent list items two spaces below the field and align the closing `]` with the field.",
+                    if map_depth > 0 {
+                        "attribute set continuation has unexpected indentation"
+                    } else {
+                        "list continuation has unexpected indentation"
+                    },
+                    if map_depth > 0 {
+                        "indent attribute assignments below the field and align the closing `}` with the field."
+                    } else {
+                        "indent list items two spaces below the field and align the closing `]` with the field."
+                    },
                 ));
             }
             source.push('\n');
@@ -496,6 +538,10 @@ impl<'a> Parser<'a> {
                     depth += 1;
                 } else if !quoted && character == ']' {
                     depth = depth.saturating_sub(1);
+                } else if !quoted && character == '{' {
+                    map_depth += 1;
+                } else if !quoted && character == '}' {
+                    map_depth = map_depth.saturating_sub(1);
                 }
             }
             self.position += 1;
@@ -540,6 +586,42 @@ fn is_identifier(value: &str) -> bool {
         })
 }
 
+fn reject_function_values(value: Value, location: SourceLocation) -> Result<Value, Diagnostic> {
+    let contains_function = match &value {
+        Value::Function(_) => true,
+        Value::List(items) => items
+            .iter()
+            .any(|item| contains_function_value(&item.value)),
+        Value::Map(fields) => fields
+            .values()
+            .any(|field| contains_function_value(&field.value)),
+        Value::String(_) | Value::Integer(_) | Value::Boolean(_) => false,
+    };
+    if contains_function {
+        Err(Diagnostic::new(
+            location.line,
+            location.column,
+            "function values cannot be stored in package definitions",
+            "call the function and assign its result instead.",
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn contains_function_value(value: &Value) -> bool {
+    match value {
+        Value::Function(_) => true,
+        Value::List(items) => items
+            .iter()
+            .any(|item| contains_function_value(&item.value)),
+        Value::Map(fields) => fields
+            .values()
+            .any(|field| contains_function_value(&field.value)),
+        Value::String(_) | Value::Integer(_) | Value::Boolean(_) => false,
+    }
+}
+
 /// Parse one source file as a Swaraj package definition.
 ///
 /// The returned syntax tree preserves source locations for package names,
@@ -552,18 +634,131 @@ fn is_identifier(value: &str) -> bool {
 /// assert_eq!(package.name, "demo");
 /// ```
 pub fn parse(source: &str) -> Result<Package, Diagnostic> {
-    Parser::new(source)?.parse()
+    Parser::new(source, None, Rc::new(RefCell::new(Vec::new())))?.parse()
+}
+
+/// Parse a package definition with a source path for relative imports.
+pub fn parse_with_path(source: &str, path: impl AsRef<Path>) -> Result<Package, Diagnostic> {
+    let path = path.as_ref().canonicalize().map_err(|error| {
+        Diagnostic::new(
+            1,
+            1,
+            format!("could not resolve source path: {error}"),
+            "provide a readable path to the source file.",
+        )
+    })?;
+    parse_with_context(source, path, Rc::new(RefCell::new(Vec::new())))
+}
+
+fn parse_with_context(
+    source: &str,
+    path: PathBuf,
+    import_stack: Rc<RefCell<Vec<PathBuf>>>,
+) -> Result<Package, Diagnostic> {
+    if import_stack.borrow().contains(&path) {
+        return Err(Diagnostic::new(
+            1,
+            1,
+            format!("import cycle detected at `{}`", path.display()),
+            "remove the circular chain of imports.",
+        ));
+    }
+    if import_stack.borrow().len() >= MAX_NESTING_DEPTH {
+        return Err(Diagnostic::new(
+            1,
+            1,
+            "import nesting exceeds the limit of 128 files",
+            "reduce the number of nested imports.",
+        ));
+    }
+    import_stack.borrow_mut().push(path.clone());
+    let result = match Parser::new(source, Some(path), import_stack.clone()) {
+        Ok(parser) => parser.parse(),
+        Err(error) => Err(error),
+    };
+    import_stack.borrow_mut().pop();
+    result
+}
+
+pub(crate) fn import_package(
+    source_path: Option<&Path>,
+    import_stack: Rc<RefCell<Vec<PathBuf>>>,
+    import: &str,
+    location: SourceLocation,
+) -> Result<Value, Diagnostic> {
+    let Some(source_path) = source_path else {
+        return Err(Diagnostic::new(
+            location.line,
+            location.column,
+            "imports require a source file path",
+            "use `parse_with_path` or the `swaraj check` command to enable relative imports.",
+        ));
+    };
+    let path = source_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(import)
+        .canonicalize()
+        .map_err(|error| {
+            Diagnostic::new(
+                location.line,
+                location.column,
+                format!("could not import `{import}`: {error}"),
+                "check that the relative import exists and can be read.",
+            )
+        })?;
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        Diagnostic::new(
+            location.line,
+            location.column,
+            format!("could not read imported file `{}`: {error}", path.display()),
+            "check the file permissions and encoding.",
+        )
+    })?;
+    let package =
+        parse_with_context(&source, path.clone(), import_stack).map_err(|mut error| {
+            error.message = format!("in imported file `{}`: {}", path.display(), error.message);
+            error
+        })?;
+    let mut fields = package.fields;
+    if fields.contains_key("packageName") {
+        return Err(Diagnostic::new(
+            location.line,
+            location.column,
+            "imported package uses the reserved attribute `packageName`",
+            "rename this field so the imported package name can be exposed.",
+        ));
+    }
+    fields.insert(
+        "packageName".to_owned(),
+        Located {
+            value: Value::String(package.name),
+            location: package.location,
+        },
+    );
+    Ok(Value::Map(fields))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Diagnostic, Located, SourceLocation, Value, parse};
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT_IMPORT_TEST: AtomicUsize = AtomicUsize::new(0);
 
     fn string_item(value: &str, line: usize, column: usize) -> Located<Value> {
         Located {
             value: Value::String(value.to_owned()),
             location: SourceLocation { line, column },
         }
+    }
+
+    fn list_values(value: &Located<Value>) -> Vec<Value> {
+        let Value::List(items) = &value.value else {
+            panic!("expected a list");
+        };
+        items.iter().map(|item| item.value.clone()).collect()
     }
 
     #[test]
@@ -687,9 +882,9 @@ package demo: # package comment
             error,
             Diagnostic {
                 line: 2,
-                column: 17,
-                message: "unexpected token after expression".to_owned(),
-                help: "remove the extra token or add an operator between values.".to_owned(),
+                column: 10,
+                message: "function application expects a function, but got a string".to_owned(),
+                help: "change the value's type or use an operator that accepts it.".to_owned(),
             }
         );
     }
@@ -772,11 +967,7 @@ package demo: # package comment
 
         let quote_error = parse("package demo:\n  version: \"valid\" trailing\n")
             .expect_err("quoted strings must contain the whole scalar");
-        assert!(
-            quote_error
-                .message
-                .contains("unexpected token after expression")
-        );
+        assert!(quote_error.message.contains("function application"));
 
         let escape_error = parse("package demo:\n  version: \"invalid\\x\"\n")
             .expect_err("unsupported string escapes should fail");
@@ -820,10 +1011,19 @@ package demo: # package comment
     }
 
     #[test]
+    fn limits_expression_nesting_with_a_diagnostic() {
+        let opening = "(".repeat(100);
+        let closing = ")".repeat(100);
+        let source = format!("package demo:\n  value: {opening}0{closing}\n");
+        let error = parse(&source).expect_err("excessive expression nesting should fail safely");
+        assert!(error.message.contains("maximum expression nesting depth"));
+    }
+
+    #[test]
     fn renders_actionable_diagnostics() {
-        let error = parse("package demo:\n  values: [\"one\" \"two\"]\n")
-            .expect_err("missing comma should fail");
-        assert!(error.message.contains("expected `,` between list items"));
+        let error = parse("package demo:\n  values: [\"one\",, \"two\"]\n")
+            .expect_err("empty list entries should fail");
+        assert!(error.message.contains("expected a value or expression"));
         assert!(error.render("demo.sw").starts_with("demo.sw:2:"));
         assert!(!error.help.is_empty());
     }
@@ -880,6 +1080,428 @@ package swaraj:
                 string_item("interpolation", 9, 29),
             ])
         );
+    }
+
+    #[test]
+    fn evaluates_attribute_sets_selection_existence_and_merge() {
+        let package = parse(
+            r#"let:
+  base: {
+    version = "1.0";
+    enabled = true;
+    labels = ["stable"];
+  }
+  config: base // { version = "2.0"; }
+  selectedOrDefault: config.channel or "stable"
+  interpolated: "${config.version}"
+in:
+package demo:
+  version: config.version
+  selectedOrDefault: selectedOrDefault
+  interpolated: interpolated
+  enabled: config.enabled
+  hasLabels: config ? labels
+  hasMissing: config ? missing
+  merged: config
+"#,
+        )
+        .expect("attribute sets, selection, existence, and merge should evaluate");
+
+        assert_eq!(
+            package.fields["version"].value,
+            Value::String("2.0".to_owned())
+        );
+        assert_eq!(
+            package.fields["selectedOrDefault"].value,
+            Value::String("stable".to_owned())
+        );
+        assert_eq!(
+            package.fields["interpolated"].value,
+            Value::String("2.0".to_owned())
+        );
+        assert_eq!(package.fields["enabled"].value, Value::Boolean(true));
+        assert_eq!(package.fields["hasLabels"].value, Value::Boolean(true));
+        assert_eq!(package.fields["hasMissing"].value, Value::Boolean(false));
+        let Value::Map(merged) = &package.fields["merged"].value else {
+            panic!("merged should be a mapping");
+        };
+        assert_eq!(merged["version"].value, Value::String("2.0".to_owned()));
+        assert!(merged.contains_key("labels"));
+    }
+
+    #[test]
+    fn reports_missing_attributes_and_invalid_map_operations() {
+        let missing = parse(
+            "let:\n  config: { version = \"1\"; }\nin:\npackage demo:\n  value: config.release\n",
+        )
+        .expect_err("missing attributes should be diagnosed");
+        assert!(
+            missing
+                .message
+                .contains("attribute `release` does not exist")
+        );
+
+        let mismatch = parse(
+            "let:\n  config: { version = \"1\"; }\nin:\npackage demo:\n  value: config // [\"invalid\"]\n",
+        )
+        .expect_err("map merging should reject non-maps");
+        assert!(mismatch.message.contains("mappings on both sides"));
+    }
+
+    #[test]
+    fn evaluates_recursive_attribute_sets_on_demand() {
+        let package = parse(
+            r#"let:
+  config: rec {
+    major = 2;
+    minor = 5;
+    version = "${major}.${minor}";
+    enabled = true;
+    summary = if enabled then "v${version}" else missing;
+    unused = missing;
+  }
+in:
+package demo:
+  version: config.version
+  summary: config.summary
+  hasUnused: config ? unused
+"#,
+        )
+        .expect("recursive attributes and lazy unused values should evaluate");
+
+        assert_eq!(
+            package.fields["version"].value,
+            Value::String("2.5".to_owned())
+        );
+        assert_eq!(
+            package.fields["summary"].value,
+            Value::String("v2.5".to_owned())
+        );
+        assert_eq!(package.fields["hasUnused"].value, Value::Boolean(true));
+    }
+
+    #[test]
+    fn recursive_attribute_sets_support_recursive_functions() {
+        let package = parse(
+            r#"let:
+  math: rec {
+    factorial = number:
+      if number == 0 then 1 else number * factorial (number - 1);
+  }
+in:
+package demo:
+  result: math.factorial 6
+"#,
+        )
+        .expect("recursive functions in recursive sets should evaluate");
+        assert_eq!(package.fields["result"].value, Value::Integer(720));
+    }
+
+    #[test]
+    fn bounds_recursive_expression_evaluation() {
+        let error = parse("let:\n  loop: value: loop value\nin:\npackage demo:\n  value: loop 0\n")
+            .expect_err("unbounded recursive calls should stop with a diagnostic");
+        assert!(
+            error
+                .message
+                .contains("maximum expression evaluation depth")
+        );
+    }
+
+    #[test]
+    fn reports_cycles_inside_recursive_attribute_sets() {
+        let error = parse("package demo:\n  config: rec { first = second; second = first; }\n")
+            .expect_err("recursive attribute cycles should be diagnosed");
+        assert!(error.message.contains("recursive attribute definition"));
+    }
+
+    #[test]
+    fn imports_package_files_relative_to_the_importing_file() {
+        let id = NEXT_IMPORT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("swaraj-import-{}-{id}", std::process::id()));
+        fs::create_dir(&directory).expect("temporary import directory should be created");
+        fs::create_dir(directory.join("sub")).expect("nested import directory should be created");
+        fs::write(
+            directory.join("sub/base.sw"),
+            "package base:\n  version: \"1.2\"\n  requirements:\n    compiler: \"rustc\"\n",
+        )
+        .expect("imported package should be written");
+        fs::write(directory.join("sub/version.txt"), "release-1.2\n")
+            .expect("imported text file should be written");
+        let source = r#"let:
+  base: builtins.import "sub/base.sw"
+  sourceText: builtins.readFile "sub/version.txt"
+in:
+package app:
+  version: base.version
+  importedName: base.packageName
+  compiler: base.requirements.compiler
+  sourceExists: builtins.pathExists "sub/base.sw"
+  sourceText: sourceText
+"#;
+        let main_path = directory.join("main.sw");
+        fs::write(&main_path, source).expect("main package should be written");
+        let package = super::parse_with_path(source, &main_path)
+            .expect("relative package imports should resolve");
+        assert_eq!(
+            package.fields["version"].value,
+            Value::String("1.2".to_owned())
+        );
+        assert_eq!(
+            package.fields["importedName"].value,
+            Value::String("base".to_owned())
+        );
+        assert_eq!(
+            package.fields["compiler"].value,
+            Value::String("rustc".to_owned())
+        );
+        assert_eq!(package.fields["sourceExists"].value, Value::Boolean(true));
+        assert_eq!(
+            package.fields["sourceText"].value,
+            Value::String("release-1.2\n".to_owned())
+        );
+        fs::remove_dir_all(directory).expect("temporary import directory should be removed");
+    }
+
+    #[test]
+    fn detects_import_cycles_and_requires_a_source_path() {
+        let id = NEXT_IMPORT_TEST.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("swaraj-import-{}-{id}", std::process::id()));
+        fs::create_dir(&directory).expect("temporary import directory should be created");
+        let first = directory.join("first.sw");
+        let second = directory.join("second.sw");
+        fs::write(
+            &first,
+            "let:\n  other: builtins.import \"second.sw\"\nin:\npackage first:\n  value: other.value\n",
+        )
+        .expect("first import should be written");
+        fs::write(
+            &second,
+            "let:\n  other: builtins.import \"first.sw\"\nin:\npackage second:\n  value: other.value\n",
+        )
+        .expect("second import should be written");
+        let source = fs::read_to_string(&first).expect("first import should be readable");
+        let error =
+            super::parse_with_path(&source, &first).expect_err("circular imports should fail");
+        assert!(error.message.contains("import cycle detected"));
+
+        let no_path = parse("package demo:\n  imported: builtins.import \"other.sw\"\n")
+            .expect_err("string parsing has no source path for imports");
+        assert!(no_path.message.contains("require a source file path"));
+        fs::remove_dir_all(directory).expect("temporary import directory should be removed");
+    }
+
+    #[test]
+    fn evaluates_single_argument_functions_with_lexical_bindings() {
+        let package = parse(
+            r#"let:
+  offset: 40
+  increment: value: value + 1
+  addOffset: value: value + offset
+  answer: addOffset (increment 1)
+in:
+package demo:
+  answer: answer
+"#,
+        )
+        .expect("lambda bindings and function application should evaluate");
+        assert_eq!(package.fields["answer"].value, Value::Integer(42));
+    }
+
+    #[test]
+    fn supports_curried_functions_closures_and_higher_order_calls() {
+        let package = parse(
+            r#"let:
+  offset: 10
+  makeAdder: amount: value: amount + value + offset
+  addFive: makeAdder 5
+  apply: function: value: function value
+  shadow: offset: offset
+  values: builtins.map addFive [1, 2]
+in:
+package demo:
+  answer: apply addFive 27
+  shadowed: shadow 3
+  values: values
+"#,
+        )
+        .expect("closures should capture lexical bindings and be first-class");
+        assert_eq!(package.fields["answer"].value, Value::Integer(42));
+        assert_eq!(package.fields["shadowed"].value, Value::Integer(3));
+        assert_eq!(
+            list_values(&package.fields["values"]),
+            vec![Value::Integer(16), Value::Integer(17)]
+        );
+    }
+
+    #[test]
+    fn rejects_unapplied_functions_and_calls_to_non_functions() {
+        let uncalled =
+            parse("let:\n  identity: value: value\nin:\npackage demo:\n  value: identity\n")
+                .expect_err("a function cannot be a package value");
+        assert!(uncalled.message.contains("cannot be stored"));
+
+        let not_function = parse("let:\n  value: 1\nin:\npackage demo:\n  result: value 2\n")
+            .expect_err("non-function values cannot be called");
+        assert!(not_function.message.contains("function application"));
+    }
+
+    #[test]
+    fn evaluates_core_list_attribute_and_string_builtins() {
+        let package = parse(
+            r#"let:
+  values: ["first", "second"]
+  metadata: { z = 1; a = 2; }
+in:
+package demo:
+  length: builtins.length values
+  first: builtins.head values
+  rest: builtins.tail values
+  names: builtins.attrNames metadata
+  text: builtins.toString 42
+  joined: builtins.concatStringsSep ", " values
+  containsSecond: builtins.elem "second" values
+  hasAttribute: builtins.hasAttr "a" metadata
+  attributeValue: builtins.getAttr "z" metadata
+  values: builtins.attrValues metadata
+  textLength: builtins.stringLength "café"
+  basename: builtins.baseNameOf "source/archive.tar.gz"
+  directory: builtins.dirOf "source/archive.tar.gz"
+  excerpt: builtins.substring 1 2 "café"
+  replaced: builtins.replaceStrings ["aa", "a"] ["x", "y"] "aaa"
+  isText: builtins.isString "text"
+  isNumber: builtins.isInt 42
+  isAttrs: builtins.isAttrs metadata
+  valueType: builtins.typeOf metadata
+  sequenced: builtins.seq (builtins.length values) "ready"
+  incremented: builtins.map (value: value + 1) [1, 2, 3]
+  evens: builtins.filter (value: value % 2 == 0) [1, 2, 3, 4]
+  flattened: builtins.concatLists [[1], [2, 3]]
+  total: builtins.foldl' (acc: value: acc + value) 0 [1, 2, 3, 4]
+  generated: builtins.genList (index: index * 2) 4
+  zipped: builtins.zipListsWith (left: right: left + right) [1, 2] [10, 20]
+  mappedAttributes: builtins.mapAttrs (name: value: value + 1) metadata
+  filteredAttributes: builtins.filterAttrs (name: value: name == "a") metadata
+  fromList: builtins.listToAttrs [{ name = "answer"; value = 42; }]
+"#,
+        )
+        .expect("supported built-ins should evaluate");
+
+        assert_eq!(package.fields["length"].value, Value::Integer(2));
+        assert_eq!(
+            package.fields["first"].value,
+            Value::String("first".to_owned())
+        );
+        let Value::List(rest) = &package.fields["rest"].value else {
+            panic!("tail should return a list");
+        };
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].value, Value::String("second".to_owned()));
+        let Value::List(names) = &package.fields["names"].value else {
+            panic!("attrNames should return a list");
+        };
+        assert_eq!(
+            names
+                .iter()
+                .map(|item| match &item.value {
+                    Value::String(name) => name.as_str(),
+                    other => panic!("expected an attribute name, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            vec!["a", "z"]
+        );
+        assert_eq!(package.fields["text"].value, Value::String("42".to_owned()));
+        assert_eq!(
+            package.fields["joined"].value,
+            Value::String("first, second".to_owned())
+        );
+        assert_eq!(package.fields["containsSecond"].value, Value::Boolean(true));
+        assert_eq!(package.fields["hasAttribute"].value, Value::Boolean(true));
+        assert_eq!(package.fields["attributeValue"].value, Value::Integer(1));
+        assert_eq!(
+            list_values(&package.fields["values"]),
+            vec![Value::Integer(2), Value::Integer(1)]
+        );
+        assert_eq!(package.fields["textLength"].value, Value::Integer(4));
+        assert_eq!(
+            package.fields["basename"].value,
+            Value::String("archive.tar.gz".to_owned())
+        );
+        assert_eq!(
+            package.fields["directory"].value,
+            Value::String("source".to_owned())
+        );
+        assert_eq!(
+            package.fields["excerpt"].value,
+            Value::String("af".to_owned())
+        );
+        assert_eq!(
+            package.fields["replaced"].value,
+            Value::String("xy".to_owned())
+        );
+        assert_eq!(package.fields["isText"].value, Value::Boolean(true));
+        assert_eq!(package.fields["isNumber"].value, Value::Boolean(true));
+        assert_eq!(package.fields["isAttrs"].value, Value::Boolean(true));
+        assert_eq!(
+            package.fields["valueType"].value,
+            Value::String("set".to_owned())
+        );
+        assert_eq!(
+            package.fields["sequenced"].value,
+            Value::String("ready".to_owned())
+        );
+        assert_eq!(
+            list_values(&package.fields["incremented"]),
+            vec![Value::Integer(2), Value::Integer(3), Value::Integer(4)]
+        );
+        assert_eq!(
+            list_values(&package.fields["evens"]),
+            vec![Value::Integer(2), Value::Integer(4)]
+        );
+        assert_eq!(
+            list_values(&package.fields["flattened"]),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+        assert_eq!(package.fields["total"].value, Value::Integer(10));
+        assert_eq!(
+            list_values(&package.fields["generated"]),
+            vec![
+                Value::Integer(0),
+                Value::Integer(2),
+                Value::Integer(4),
+                Value::Integer(6)
+            ]
+        );
+        assert_eq!(
+            list_values(&package.fields["zipped"]),
+            vec![Value::Integer(11), Value::Integer(22)]
+        );
+        let Value::Map(mapped) = &package.fields["mappedAttributes"].value else {
+            panic!("mapAttrs should return an attribute set");
+        };
+        assert_eq!(mapped["a"].value, Value::Integer(3));
+        let Value::Map(filtered) = &package.fields["filteredAttributes"].value else {
+            panic!("filterAttrs should return an attribute set");
+        };
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered["a"].value, Value::Integer(2));
+        let Value::Map(from_list) = &package.fields["fromList"].value else {
+            panic!("listToAttrs should return an attribute set");
+        };
+        assert_eq!(from_list["answer"].value, Value::Integer(42));
+    }
+
+    #[test]
+    fn reports_invalid_builtin_arguments_and_names() {
+        let empty_head = parse("package demo:\n  value: builtins.head []\n")
+            .expect_err("head on an empty list should fail");
+        assert!(empty_head.message.contains("empty list"));
+
+        let unknown = parse("package demo:\n  value: builtins.notReal []\n")
+            .expect_err("unknown built-ins should fail");
+        assert!(unknown.message.contains("unknown built-in"));
     }
 
     #[test]
