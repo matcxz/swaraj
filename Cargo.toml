@@ -3,7 +3,8 @@ name = "swaraj"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Prototype parser for the Swaraj declarative language"
+description = "An experimental declarative language for readable package definitions, implemented in Rust."
+license = "GPL-3.0-only"
 
 [dependencies]
 

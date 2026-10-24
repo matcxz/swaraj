@@ -1,5 +1,8 @@
 # Swaraj
 
+Swaraj is free software licensed under the GNU General Public License
+version 3. See [LICENSE](LICENSE) for details.
+
 Swaraj is an independent, declarative language for describing package
 definitions. This repository contains its initial Rust implementation: a
 parser, expression evaluator, syntax-checking command, and examples. It does
